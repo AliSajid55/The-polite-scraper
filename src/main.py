@@ -1,4 +1,4 @@
-"""Books to Scrape - Polite Scraper (Step 4: Clean, validate, store)"""
+"""Books to Scrape - Polite Scraper (Step 5: Resilient runs with reporting)"""
 
 import hashlib
 import json
@@ -20,6 +20,7 @@ USER_AGENT = "FlyRankInternshipA9/1.0 (https://github.com/your-repo)"
 TIMEOUT = 10  # seconds
 MAX_PAGES = 3
 DELAY = 0.5  # seconds between real (non-cached) requests
+RETRY_DELAY = 2  # seconds before retrying on 5xx/timeout
 
 
 # --- Pydantic Schema ---
@@ -51,6 +52,36 @@ class BookRecord(BaseModel):
         if v < 0:
             raise ValueError(f"Price must be non-negative, got: {v}")
         return v
+
+
+# --- Run stats tracking ---
+
+
+class RunStats:
+    """Track honest numbers for the run report."""
+
+    def __init__(self):
+        self.start_time = datetime.now(timezone.utc)
+        self.pages_fetched = 0
+        self.cache_hits = 0
+        self.valid_records = 0
+        self.invalid_records = 0
+        self.failed_pages: list[dict] = []
+
+    def duration_seconds(self) -> float:
+        now = datetime.now(timezone.utc)
+        return (now - self.start_time).total_seconds()
+
+    def to_dict(self) -> dict:
+        return {
+            "start_time": self.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "duration_seconds": round(self.duration_seconds(), 1),
+            "pages_fetched": self.pages_fetched,
+            "cache_hits": self.cache_hits,
+            "valid_records": self.valid_records,
+            "invalid_records": self.invalid_records,
+            "failed_pages": self.failed_pages,
+        }
 
 
 # --- Utility functions ---
@@ -86,31 +117,60 @@ def save_cache(file_path: str, content: str) -> None:
 
 
 def fetch_page(url: str) -> str:
-    """Fetch a page from the web with polite headers."""
+    """Fetch a page from the web with polite headers. Raises on HTTP errors."""
     headers = {"User-Agent": USER_AGENT}
     response = requests.get(url, headers=headers, timeout=TIMEOUT)
     if response.status_code != 200:
-        raise Exception(f"Failed to fetch {url}: {response.status_code}")
+        raise requests.HTTPError(
+            f"HTTP {response.status_code} for {url}", response=response
+        )
     return response.text
 
 
-def get_page(url: str) -> str:
-    """Get page content: use cache if available, otherwise fetch with delay."""
+def should_retry(exc: Exception) -> bool:
+    """Return True if the error is retryable (timeout or 5xx)."""
+    if isinstance(exc, requests.Timeout):
+        return True
+    if isinstance(exc, requests.ConnectionError):
+        return True
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code >= 500
+    return False
+
+
+def get_page(url: str, stats: RunStats) -> str:
+    """Get page content: cache → fetch with retry → raise on failure."""
     cache_file = cache_path_for_url(url)
     cached = load_cache(cache_file)
     if cached:
+        stats.cache_hits += 1
         return cached
 
+    # Real request — respect delay
     time.sleep(DELAY)
     print(f"  FETCHING - {url}")
-    html = fetch_page(url)
-    save_cache(cache_file, html)
-    return html
+
+    try:
+        html = fetch_page(url)
+        stats.pages_fetched += 1
+        save_cache(cache_file, html)
+        return html
+    except Exception as exc:
+        if should_retry(exc):
+            print(f"  RETRY in {RETRY_DELAY}s — {exc}")
+            time.sleep(RETRY_DELAY)
+            try:
+                html = fetch_page(url)
+                stats.pages_fetched += 1
+                save_cache(cache_file, html)
+                return html
+            except Exception as retry_exc:
+                raise retry_exc
+        raise
 
 
 def clean_price(price_text: str) -> float:
     """Convert price_text like '£51.77' to a float 51.77."""
-    # Remove currency symbols and whitespace, then convert to float
     cleaned = re.sub(r"[^\d.]", "", price_text)
     return float(cleaned)
 
@@ -119,9 +179,7 @@ def clean_price(price_text: str) -> float:
 
 
 def extract_book_links(html: str, page_url: str) -> list[tuple[str, str]]:
-    """Extract book links from a catalogue page.
-    Returns list of (absolute_url, source_page) tuples.
-    """
+    """Extract book links from a catalogue page."""
     soup = BeautifulSoup(html, "html.parser")
     links = []
     for tag in soup.select("article.product_pod h3 a"):
@@ -151,19 +209,15 @@ def extract_raw_record(html: str, product_url: str, source_page: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     product = soup.select_one("div.product_main")
 
-    # Title
     title_tag = product.select_one("h1") if product else None
     title = title_tag.text.strip() if title_tag else ""
 
-    # Price
     price_tag = product.select_one("p.price_color") if product else None
     price_text = price_tag.text.strip() if price_tag else ""
 
-    # Availability
     avail_tag = product.select_one("p.instock.availability") if product else None
     availability_text = avail_tag.text.strip() if avail_tag else ""
 
-    # Rating (second class on p.star-rating, e.g. "Three")
     rating_text = None
     if product:
         rating_tag = product.select_one("p.star-rating")
@@ -175,7 +229,6 @@ def extract_raw_record(html: str, product_url: str, source_page: str) -> dict:
                         rating_text = cls
                         break
 
-    # Description — found after #product_description div
     description = None
     desc_div = soup.select_one("#product_description")
     if desc_div:
@@ -183,7 +236,6 @@ def extract_raw_record(html: str, product_url: str, source_page: str) -> dict:
         if next_p:
             description = next_p.text.strip()
 
-    # Fetched timestamp (UTC ISO-8601)
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return {
@@ -225,31 +277,30 @@ def save_errors(errors: list[dict]) -> None:
         json.dump(errors, f, indent=2, ensure_ascii=False)
 
 
+def save_run_report(stats: RunStats) -> None:
+    """Save run-report.json with honest numbers."""
+    report_file = os.path.join(OUTPUT_DIR, "run-report.json")
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(stats.to_dict(), f, indent=2, ensure_ascii=False)
+
+
 def clean_and_validate(raw_records: list[dict]) -> tuple[dict[str, dict], list[dict]]:
     """Clean raw records, validate with Pydantic, return (valid_books, errors)."""
     valid_books: dict[str, dict] = {}
     errors: list[dict] = []
 
     for raw in raw_records:
-        # Add price_gbp
         try:
             raw["price_gbp"] = clean_price(raw["price_text"])
         except (ValueError, KeyError) as e:
-            errors.append({
-                "record": raw,
-                "error": f"Price cleaning failed: {e}",
-            })
+            errors.append({"record": raw, "error": f"Price cleaning failed: {e}"})
             continue
 
-        # Validate with Pydantic
         try:
             book = BookRecord(**raw)
             valid_books[book.product_url] = book.model_dump()
         except Exception as e:
-            errors.append({
-                "record": raw,
-                "error": f"Validation failed: {e}",
-            })
+            errors.append({"record": raw, "error": f"Validation failed: {e}"})
 
     return valid_books, errors
 
@@ -258,6 +309,7 @@ def main():
     """Main entry point — crawl, extract, clean, validate, store."""
     ensure_dir(CACHE_DIR)
     ensure_dir(OUTPUT_DIR)
+    stats = RunStats()
 
     # --- Stage 1: Discover all book links ---
     all_links: list[tuple[str, str]] = []
@@ -266,13 +318,21 @@ def main():
 
     for page_num in range(1, MAX_PAGES + 1):
         print(f"\n--- Page {page_num} ---")
-        html = get_page(current_url)
+        html = None
+        try:
+            html = get_page(current_url, stats)
+            page_links = extract_book_links(html, current_url)
+            all_links.extend(page_links)
+            print(f"  Found {len(page_links)} book links on this page")
+        except Exception as e:
+            print(f"  FAILED page {page_num}: {e}")
+            stats.failed_pages.append({
+                "url": current_url,
+                "stage": "catalogue",
+                "error": str(e),
+            })
 
-        page_links = extract_book_links(html, current_url)
-        all_links.extend(page_links)
-        print(f"  Found {len(page_links)} book links on this page")
-
-        if page_num < MAX_PAGES:
+        if page_num < MAX_PAGES and html is not None:
             next_url = find_next_page(html, current_url)
             if next_url:
                 current_url = next_url
@@ -299,9 +359,17 @@ def main():
 
     for i, (book_url, source_page) in enumerate(unique_books, 1):
         print(f"\n[{i}/{len(unique_books)}] {book_url.split('/')[-2]}")
-        html = get_page(book_url)
-        record = extract_raw_record(html, book_url, source_page)
-        raw_records.append(record)
+        try:
+            html = get_page(book_url, stats)
+            record = extract_raw_record(html, book_url, source_page)
+            raw_records.append(record)
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            stats.failed_pages.append({
+                "url": book_url,
+                "stage": "detail",
+                "error": str(e),
+            })
 
     print(f"\n{'='*40}")
     print(f"detail_pages={len(raw_records)}")
@@ -311,7 +379,10 @@ def main():
     print(f"\n--- Cleaning and validating ---")
     new_books, errors = clean_and_validate(raw_records)
 
-    # Merge with existing books (idempotent — same URL keeps first seen record)
+    stats.valid_records = len(new_books)
+    stats.invalid_records = len(errors)
+
+    # Merge with existing books (idempotent)
     existing_books = load_existing_books()
     for url, book in new_books.items():
         if url not in existing_books:
@@ -320,6 +391,7 @@ def main():
     save_books(existing_books)
     if errors:
         save_errors(errors)
+    save_run_report(stats)
 
     # Checkpoint
     all_prices = [b["price_gbp"] for b in existing_books.values()]
@@ -332,9 +404,9 @@ def main():
     print(f"price_gbp_all_numbers={prices_ok}")
     print(f"urls_all_https={https_ok}")
     print(f"validation_errors={len(errors)}")
+    print(f"failed_pages={len(stats.failed_pages)}")
     print(f"{'='*40}")
 
-    # Show sample cleaned record
     sample = list(existing_books.values())[0]
     print(f"\nSAMPLE CLEANED RECORD:")
     print(json.dumps(sample, indent=2))
