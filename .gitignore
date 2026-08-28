@@ -7,3 +7,9 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Cache directory (large HTML files, not needed in repo)
+cache/
+
+# Raw records (intermediate output, regenerated on each run)
+output/raw_records.json
