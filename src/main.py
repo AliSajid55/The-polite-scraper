@@ -1,5 +1,6 @@
-"""Books to Scrape - Polite Scraper (Step 5: Resilient runs with reporting)"""
+"""Books to Scrape - Polite Scraper (CSV export + dashboard)"""
 
+import csv
 import hashlib
 import json
 import os
@@ -305,6 +306,126 @@ def clean_and_validate(raw_records: list[dict]) -> tuple[dict[str, dict], list[d
     return valid_books, errors
 
 
+# --- Stage 4: CSV export ---
+
+
+def flatten_for_csv(value: str | None) -> str:
+    """Flatten a value for CSV: replace newlines with spaces, strip."""
+    if value is None:
+        return ""
+    return value.replace("\n", " ").replace("\r", " ").strip()
+
+
+def export_csv(books: dict[str, dict]) -> None:
+    """Export validated books to books.csv."""
+    csv_file = os.path.join(OUTPUT_DIR, "books.csv")
+    fieldnames = [
+        "title",
+        "product_url",
+        "price_text",
+        "price_gbp",
+        "availability_text",
+        "rating_text",
+        "description",
+        "source_page",
+        "fetched_at",
+    ]
+
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for book in books.values():
+            row = dict(book)
+            # Flatten fields that may contain newlines/commas
+            row["description"] = flatten_for_csv(row["description"])
+            row["title"] = flatten_for_csv(row["title"])
+            row["availability_text"] = flatten_for_csv(row["availability_text"])
+            writer.writerow(row)
+
+
+# --- Stage 5: Dashboard ---
+
+
+def generate_dashboard(books: dict[str, dict]) -> None:
+    """Generate a local HTML dashboard with key stats."""
+    prices = [b["price_gbp"] for b in books.values()]
+    min_price = min(prices) if prices else 0
+    max_price = max(prices) if prices else 0
+    avg_price = sum(prices) / len(prices) if prices else 0
+
+    # Find last fresh timestamp
+    fetch_times = [b["fetched_at"] for b in books.values()]
+    last_fresh = max(fetch_times) if fetch_times else "N/A"
+
+    # Load run report for failure info
+    report_file = os.path.join(OUTPUT_DIR, "run-report.json")
+    failed_pages = 0
+    if os.path.exists(report_file):
+        with open(report_file, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        failed_pages = len(report.get("failed_pages", []))
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scraper Dashboard</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 2rem; }}
+        .container {{ max-width: 800px; margin: 0 auto; }}
+        h1 {{ color: #333; margin-bottom: 2rem; }}
+        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
+        .card {{ background: white; border-radius: 8px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .card h2 {{ font-size: 2rem; color: #2563eb; }}
+        .card p {{ color: #666; margin-top: 0.5rem; font-size: 0.9rem; }}
+        .card.warning h2 {{ color: #dc2626; }}
+        .card.success h2 {{ color: #16a34a; }}
+        table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        th, td {{ padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background: #f9fafb; font-weight: 600; color: #555; }}
+        .note {{ color: #888; font-size: 0.85rem; margin-top: 1.5rem; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Scraper Dashboard</h1>
+        <div class="cards">
+            <div class="card success">
+                <h2>{len(books)}</h2>
+                <p>Records</p>
+            </div>
+            <div class="card">
+                <h2>&pound;{min_price:.2f} - &pound;{max_price:.2f}</h2>
+                <p>Price Range</p>
+            </div>
+            <div class="card">
+                <h2>&pound;{avg_price:.2f}</h2>
+                <p>Average Price</p>
+            </div>
+            <div class="card {"warning" if failed_pages > 0 else "success"}">
+                <h2>{failed_pages}</h2>
+                <p>Failed Pages</p>
+            </div>
+        </div>
+        <table>
+            <tr><th>Last Fresh</th><td>{last_fresh}</td></tr>
+            <tr><th>Total Books</th><td>{len(books)}</td></tr>
+            <tr><th>Price Range</th><td>&pound;{min_price:.2f} to &pound;{max_price:.2f}</td></tr>
+            <tr><th>Average Price</th><td>&pound;{avg_price:.2f}</td></tr>
+            <tr><th>Failed Pages</th><td>{failed_pages}</td></tr>
+        </table>
+        <p class="note">Data sourced from books.toscrape.com. Dashboard generated automatically.</p>
+    </div>
+</body>
+</html>"""
+
+    dashboard_file = os.path.join(OUTPUT_DIR, "dashboard.html")
+    with open(dashboard_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
 def main():
     """Main entry point — crawl, extract, clean, validate, store."""
     ensure_dir(CACHE_DIR)
@@ -392,6 +513,16 @@ def main():
     if errors:
         save_errors(errors)
     save_run_report(stats)
+
+    # --- Stage 4: CSV export ---
+    print(f"\n--- Exporting CSV ---")
+    export_csv(existing_books)
+    print(f"Saved {len(existing_books)} records to books.csv")
+
+    # --- Stage 5: Dashboard ---
+    print(f"\n--- Generating dashboard ---")
+    generate_dashboard(existing_books)
+    print(f"Dashboard saved to dashboard.html")
 
     # Checkpoint
     all_prices = [b["price_gbp"] for b in existing_books.values()]
